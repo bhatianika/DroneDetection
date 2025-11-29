@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-# updated_yolo_detect_arducam_fixed.py
+# updated_yolo_detect_arducam_fixed_with_fresh_lidar.py
 """
-Corrected YOLO + TF-Luna integration script.
-- Validates TF-Luna checksum
-- Handles signed temperature properly
-- Optional smoothing for distance (moving average)
-- Better serial port discovery and --port override
-- Thread stop + join for clean shutdown
-- Use LiDAR reading only when likely to correspond to bbox (single detection OR bbox near image center)
+YOLO + TF-Luna integration (final corrected):
+- LiDAR parsing with checksum & signed temp
+- LiDAR smoothing for background values
+- LiDAR used ONLY when a drone is detected and reading is fresh (post-frame)
+- Averages a few fresh samples immediately after detection to reduce noise
+- Keeps original camera & detection behavior intact
 """
 
 import os
@@ -85,7 +84,7 @@ class TFLunaReader(threading.Thread):
                             temp_c = temp_raw / 8.0
 
                             ts = time.time()
-                            # smoothing (moving average on cm)
+                            # smoothing (moving average on cm) for background/latest
                             self._smooth_window.append(dist_cm)
                             smooth_cm = int(sum(self._smooth_window) / len(self._smooth_window))
 
@@ -130,15 +129,49 @@ def find_serial_port():
     for pat in patterns:
         lst = glob.glob(pat)
         if lst:
-            # return first non-busy candidate
+            # return first candidate
             for p in lst:
                 if os.path.exists(p):
                     return p
-    # fallback to the small known list used previously
+    # fallback to the small known list
     for p in ["/dev/serial0", "/dev/ttyUSB0", "/dev/ttyS0", "/dev/ttyAMA0"]:
         if os.path.exists(p):
             return p
     return None
+
+# ----------------- Helper: fresh lidar samples after a frame -----------------
+def get_fresh_lidar(lidar_reader, frame_ts, max_wait=0.25, n_avg=3, required_interval=0.01):
+    """
+    Wait for up to max_wait seconds to collect n_avg TF-Luna snapshots that are newer than frame_ts.
+    Returns (avg_dist_cm, avg_strength, avg_temp_c, last_ts) or None if no fresh samples found.
+    """
+    if lidar_reader is None:
+        return None
+
+    samples = []
+    start = time.time()
+    last_sample_ts = 0.0
+    while time.time() - start <= max_wait and len(samples) < max(1, n_avg):
+        snap = lidar_reader.snapshot()
+        if snap is None:
+            time.sleep(0.005)
+            continue
+        dist_cm, strength, temp_c, ts = snap
+        # accept only samples strictly newer than frame_ts and newer than previous sample
+        if ts > frame_ts and ts > last_sample_ts + required_interval:
+            samples.append((dist_cm, strength, temp_c, ts))
+            last_sample_ts = ts
+        else:
+            time.sleep(0.005)
+
+    if not samples:
+        return None
+
+    avg_dist = int(sum(s[0] for s in samples) / len(samples))
+    avg_strength = int(sum(s[1] for s in samples) / len(samples))
+    avg_temp = float(sum(s[2] for s in samples) / len(samples))
+    last_ts = samples[-1][3]
+    return (avg_dist, avg_strength, avg_temp, last_ts)
 
 # ----------------- Argument Parser -----------------
 parser = argparse.ArgumentParser()
@@ -150,6 +183,9 @@ parser.add_argument('--record', help='Record results from video or webcam and sa
 parser.add_argument('--port', help='Serial port for TF-Luna (optional). If not provided, the script will try to auto-detect.', default=None)
 parser.add_argument('--smoothing', help='Moving average window size for TF-Luna distance smoothing (default=5)', type=int, default=5)
 parser.add_argument('--center-only', help='Only use LiDAR distance if bbox center is near image center (fraction of width/height, default=0.25)', type=float, default=0.25)
+parser.add_argument('--lidar-min-strength', help='Minimum strength to accept LiDAR reading as reliable (default=100)', type=int, default=100)
+parser.add_argument('--lidar-max-wait', help='Max wait (s) for fresh LiDAR samples after a frame (default=0.25)', type=float, default=0.25)
+parser.add_argument('--lidar-navg', help='Number of fresh LiDAR samples to average (default=3)', type=int, default=3)
 args = parser.parse_args()
 
 # ----------------- Model Setup -----------------
@@ -161,6 +197,9 @@ record = args.record
 smoothing_window = args.smoothing
 user_port = args.port
 center_only_frac = args.center_only
+lidar_min_strength = args.lidar_min_strength
+lidar_max_wait = args.lidar_max_wait
+lidar_navg = max(1, args.lidar_navg)
 
 if (not os.path.exists(model_path)):
     print('ERROR: Model path is invalid or model was not found. Make sure the model filename was entered correctly.')
@@ -310,26 +349,32 @@ try:
             img_filename = imgs_list[img_count]
             frame = cv2.imread(img_filename)
             img_count += 1
+            # timestamp frame right after capture/read
+            frame_ts = time.time()
         elif source_type == 'video':
             ret, frame = cap.read()
             if not ret:
                 print('Reached end of the video file. Exiting program.')
                 break
+            frame_ts = time.time()
         elif source_type == 'usb':
             ret, frame = cap.read()
             if (frame is None) or (not ret):
                 print('Unable to read frames from the USB camera. Exiting program. ')
                 break
+            frame_ts = time.time()
         elif source_type == 'picamera':
             frame = cap.capture_array()
             if frame is None:
                 print('Unable to read frames from the Picamera. Exiting program. ')
                 break
+            frame_ts = time.time()
         elif source_type == 'arducam':
             ret, frame = cap.read()
             if (frame is None) or (not ret):
                 print('Unable to read frames from the Arducam. Exiting program. ')
                 break
+            frame_ts = time.time()
 
         if resize:
             frame = cv2.resize(frame, (resW, resH))
@@ -381,18 +426,23 @@ try:
                             use_lidar = True
 
                 if use_lidar:
-                    dist_tuple = lidar_reader.snapshot() if lidar_reader else None
-                    if dist_tuple is not None:
-                        dist_cm, strength, temp_c, ts = dist_tuple
-                        # display in meters as well as cm
-                        dist_m = dist_cm / 100.0
-                        print(f"[{time.strftime('%H:%M:%S')}] Drone detected: {dist_cm} cm ({dist_m:.2f} m), strength={strength}, temp={temp_c:.1f}°C")
-                        cv2.putText(frame, f"Dist: {dist_cm} cm", (xmin, max(12, ymin-25)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                    # request fresh lidar samples taken after this frame timestamp
+                    fresh = get_fresh_lidar(lidar_reader, frame_ts, max_wait=lidar_max_wait, n_avg=lidar_navg, required_interval=0.01)
+                    if fresh is not None:
+                        dist_cm, strength, temp_c, ts = fresh
+                        # reliability check
+                        if strength < lidar_min_strength:
+                            # treat as unreliable
+                            cv2.putText(frame, "Dist: unreliable", (xmin, max(12, ymin-25)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+                        else:
+                            dist_m = dist_cm / 100.0
+                            print(f"[{time.strftime('%H:%M:%S')}] Drone detected: {dist_cm} cm ({dist_m:.2f} m), strength={strength}, temp={temp_c:.1f}°C (lidar_ts={ts:.3f})")
+                            cv2.putText(frame, f"Dist: {dist_cm} cm", (xmin, max(12, ymin-25)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
                     else:
-                        # no recent LiDAR reading yet
+                        # no fresh LiDAR reading — show placeholder (and avoid showing stale values)
                         cv2.putText(frame, "Dist: --", (xmin, max(12, ymin-25)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,140,255), 2)
                 else:
-                    # we intentionally avoid showing LiDAR data if ambiguous
+                    # intentionally avoid showing LiDAR data if ambiguous
                     pass
 
         # overlays
